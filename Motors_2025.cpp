@@ -1,50 +1,50 @@
-#include <HardwareSerial.h>
-#include <Arduino.h>
-#include <ArduinoJson.h>
-#include <Wire.h>
-#include "MS5837.h"
-#include <PID.h>
-#include <TMCStepper.h>
+#include <HardwareSerial.h>  // Additional UART ports (LoRa lives on Serial2)
+#include <Arduino.h>         // Core Arduino API
+#include <ArduinoJson.h>     // Lightweight JSON builder/parser
+#include <Wire.h>            // I2C bus for the MS5837 sensor
+#include "MS5837.h"          // Blue Robotics pressure/depth sensor driver
+#include <PID.h>             // PID helper
+#include <TMCStepper.h>      // TMC2209 stepper driver configuration
 
-#define LED 2
-MS5837 sensor;
+#define LED 2        // Onboard status LED pin
+MS5837 sensor;       // Pressure/depth sensor instance
 
 // defines pins
 // LoRa
-String received;
-HardwareSerial LoRaSerial(2);  // accessing Uart
-#define RX_PIN 16
-#define TX_PIN 17
-#define LORA_BAUD 115200
+String received;                    // Buffer for incoming LoRa UART payloads
+HardwareSerial LoRaSerial(2);       // UART2 is used for the LoRa module
+#define RX_PIN 16                   // ESP32 GPIO used for LoRa RX
+#define TX_PIN 17                   // ESP32 GPIO used for LoRa TX
+#define LORA_BAUD 115200            // Baud rate for the RYLR897
 // Motor
-int motor_cycles = 0;
-#define stepPin 18
-#define dirPin 5
-#define enPin 19
-#define DRIVER_ADDRESS 0  // MS1/MS2 = GND/GND → address 0
-#define R_SENSE 0.11f     // Rsense value in ohms on your board
+int motor_cycles = 0;               // Placeholder for future cycle tracking
+#define stepPin 18                  // Step pulse output to TMC2209
+#define dirPin 5                    // Direction control pin
+#define enPin 19                    // Enable pin for the driver
+#define DRIVER_ADDRESS 0            // MS1/MS2 = GND/GND → address 0
+#define R_SENSE 0.11f               // Rsense value in ohms on your board
 
 // Use hardware Serial1 (TX1/RX1) on boards that support it
-TMC2209Stepper driver(&Serial1, R_SENSE, DRIVER_ADDRESS);
+TMC2209Stepper driver(&Serial1, R_SENSE, DRIVER_ADDRESS);  // Driver bound to Serial1 UART
 
 
 struct SensorData {
-  int time;
-  float pressure;
-  float depth;
+  int time;       // Seconds since boot for the reading
+  float pressure; // Pressure in mbar
+  float depth;    // Depth in meters
 };
 
-SensorData current[200];
-String jsonString[200];
+SensorData current[200];  // Logged sensor samples
+String jsonString[200];   // Serialized JSON payloads
 
-float M3_error = 0;
-float M3_setpoint = 0;
-float M3_previous = 0;
-float M3_corrective_val = 0;
-int curr_json = 0;
+float M3_error = 0;           // Placeholder for PID error
+float M3_setpoint = 0;        // Target depth (unused for now)
+float M3_previous = 0;        // Previous error input for PID
+float M3_corrective_val = 0;  // Output from PID computation
+int curr_json = 0;            // Index of next free JSON slot
 
-int first_run = 0;
-int motor = 0;
+int first_run = 0;  // Tracks whether initial purge/startup ran
+int motor = 0;      // Motor active flag controlled by LoRa
 
 String writeSensorData(const SensorData& data) {
   // set capacity of JsonDocument
@@ -54,14 +54,14 @@ String writeSensorData(const SensorData& data) {
   StaticJsonDocument<capacity> doc;
 
   //putting data into doc
-  doc["c"] = "EX05";
-  doc["t"] = data.time;
-  doc["p"] = data.pressure;
-  doc["d"] = data.depth;
+  doc["c"] = "EX05";        // Tag identifying mission/sample block
+  doc["t"] = data.time;     // Timestamp
+  doc["p"] = data.pressure; // Pressure
+  doc["d"] = data.depth;    // Depth
 
   // convert doc to string
-  char jsonString[50];
-  serializeJson(doc, jsonString);
+  char jsonString[50];             // Fixed-size buffer sized for the small JSON
+  serializeJson(doc, jsonString);  // Serialize JSON into char buffer
   return jsonString;
 }
 
@@ -83,48 +83,48 @@ String writeData(String name, const float data) {
 
 void check_json() {
   if (curr_json >= 198) {
-    digitalWrite(dirPin, HIGH);
-    step(14725 * 4.36, 1000);
-    motor = 0;
+    digitalWrite(dirPin, HIGH);        // Reverse direction to clear water if buffer overflows
+    step(14725 * 4.36, 1000);          // Extended purge move; multiplier compensates missed steps
+    motor = 0;                         // Force stop to avoid overruns
   }
 }
 
 void setup() {
   // LORA
-  Serial.begin(115200);                                     // beginning baud rate
-  LoRaSerial.begin(LORA_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);  // LoRa module UART initialization
+  Serial.begin(115200);                                     // USB serial for debugging
+  LoRaSerial.begin(LORA_BAUD, SERIAL_8N1, RX_PIN, TX_PIN);  // Configure UART2 with pins/baud/parity
 
   delay(1000);  // in case the lora module takes long to initialize
   Serial.println("\nRYLR897 Test");
 
   Serial.println("Try AT commands now");
 
-  LoRaSerial.print("AT\r\n");
+  LoRaSerial.print("AT\r\n");             // Basic attention command to verify module presence
   delay(1000);
 
-  LoRaSerial.print("AT+ADDRESS=116\r\n");  //needs to be unique
+  LoRaSerial.print("AT+ADDRESS=116\r\n");  // Assign node address (unique per radio)
   delay(1000);                             //wait for module to respond
 
-  LoRaSerial.print("AT+NETWORKID=10\r\n");  //needs to be same for receiver and transmitter
+  LoRaSerial.print("AT+NETWORKID=10\r\n");  // Join radio network ID shared with peer
   delay(1000);                              //wait for module to respond
 
-  LoRaSerial.print("AT+BAND=915000000\r\n");  //Bandwidth set to 868.5MHz
+  LoRaSerial.print("AT+BAND=915000000\r\n");  // Select RF frequency band (915 MHz region)
   delay(1000);                                //wait for module to respond
 
-  LoRaSerial.print("AT+PARAMETER=10,7,1,7\r\n");  //For Less than 3Kms
+  LoRaSerial.print("AT+PARAMETER=10,7,1,7\r\n");  // Modem settings: BW/SF/CR/Preamble
   delay(1000);                                    //wait for module to respond
 
-  LoRaSerial.print("AT+PARAMETER?\r\n");  //For Less than 3Kms
+  LoRaSerial.print("AT+PARAMETER?\r\n");  // Query current modem settings
   //Serial.print("AT+PARAMETER=10,7,1,7\r\n");    //For More than 3Kms
   delay(500);  //wait for module to respond
 
-  LoRaSerial.print("AT+BAND?\r\n");  //Bandwidth set to 868.5MHz
+  LoRaSerial.print("AT+BAND?\r\n");  // Query band to confirm configuration
   delay(500);                        //wait for module to respond
 
-  LoRaSerial.print("AT+NETWORKID?\r\n");  //needs to be same for receiver and transmitter
+  LoRaSerial.print("AT+NETWORKID?\r\n");  // Confirm network ID
   delay(500);                             //wait for module to respond
 
-  LoRaSerial.print("AT+ADDRESS?\r\n");  //needs to be unique
+  LoRaSerial.print("AT+ADDRESS?\r\n");  // Confirm node address
   delay(500);                           //wait for module to respond
 
   pinMode(LED, OUTPUT);
@@ -134,11 +134,11 @@ void setup() {
   // MOTOR
 
   // Sets the two pins as Outputs
-  pinMode(stepPin, OUTPUT);
-  pinMode(enPin, OUTPUT);
-  digitalWrite(enPin, HIGH);
-  pinMode(dirPin, OUTPUT);
-  pinMode(LED, OUTPUT);
+  pinMode(stepPin, OUTPUT);  // Configure step output pin
+  pinMode(enPin, OUTPUT);    // Configure enable pin
+  digitalWrite(enPin, HIGH); // Hold driver disabled until commanded
+  pinMode(dirPin, OUTPUT);   // Configure direction pin
+  pinMode(LED, OUTPUT);      // LED configured for status
   //delay(300000);
 
   driver.begin();
@@ -182,12 +182,12 @@ void setup() {
 }
 
 void loop() {
-  digitalWrite(enPin, HIGH);
+  digitalWrite(enPin, HIGH);  // Keep motor disabled until a start command arrives
   // LORA
   // Forward Serial Monitor input to LoRa module sends the serial monitor input to the lora module
   if (Serial.available()) {
-    String command = Serial.readStringUntil('\n');
-    LoRaSerial.print(command + "\r\n");  // Send to LoRa module with CRLF
+    String command = Serial.readStringUntil('\n');  // Capture full line from USB serial
+    LoRaSerial.print(command + "\r\n");             // Relay host command to LoRa (AT passthrough)
   }
 
   // reads in LoRa module response to Serial Monitor
@@ -201,9 +201,9 @@ void loop() {
         while (motor == 1) {
           received = LoRaSerial.readString();
           Serial.print(received);
-          digitalWrite(enPin, LOW);
-          digitalWrite(LED, HIGH);
-          digitalWrite(dirPin, HIGH);  // Intake water
+          digitalWrite(enPin, LOW);            // Enable TMC2209 to drive motor
+          digitalWrite(LED, HIGH);             // Visual indicator motor is active
+          digitalWrite(dirPin, HIGH);          // Intake water
           first_run++;
           if (received[11] == '0') {
             digitalWrite(LED, LOW);
@@ -263,7 +263,7 @@ void loop() {
           jsonString[curr_json] = writeData("Curr_depth", sensor.depth());
           curr_json++;
           check_json();
-          M3_corrective_val = pid(sensor.depth(), M3_previous);
+          M3_corrective_val = pid(sensor.depth(), M3_previous);  // Another PID sample post-dive
           jsonString[curr_json] = writeData("PID_Val", M3_corrective_val);
           curr_json++;
           check_json();
@@ -274,15 +274,15 @@ void loop() {
 
           // Read from Sensor
 
-          for (int i = 1; i < 11; i++) {
-            sensor.read();
-            current[i].time = millis() / 1000;
+          for (int i = 1; i < 11; i++) {        // Collect 10 samples over 10 seconds
+            sensor.read();                      // Update sensor registers
+            current[i].time = millis() / 1000;  // Log current time in seconds
             current[i].pressure = sensor.pressure();
             current[i].depth = sensor.depth();
 
-            jsonString[i + curr_json] = writeSensorData(current[i]);
+            jsonString[i + curr_json] = writeSensorData(current[i]);  // Serialize and store reading
             delay(1000);
-            Serial.println(jsonString[i + curr_json]);
+            Serial.println(jsonString[i + curr_json]);               // Print JSON for debugging
           }
           curr_json += 10;
           check_json();
@@ -300,7 +300,7 @@ void loop() {
           jsonString[curr_json] = writeData("Curr_depth", sensor.depth());
           curr_json++;
           check_json();
-          M3_corrective_val = pid(sensor.depth(), M3_previous);
+          M3_corrective_val = pid(sensor.depth(), M3_previous);  // PID after ascent move
           jsonString[curr_json] = writeData("PID_Val", M3_corrective_val);
           curr_json++;
           check_json();
@@ -325,7 +325,7 @@ void loop() {
 
 
           //Serial.println("LED is off");
-          curr_json = 0;
+          curr_json = 0;  // Reset buffer index for next mission
           if (received[11] == '0') {  //in this case our single received byte would always be at the 11th position
             digitalWrite(LED, LOW);
             digitalWrite(enPin, HIGH);
